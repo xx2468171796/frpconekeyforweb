@@ -30,6 +30,77 @@ print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# 通用服务管理函数
+service_control() {
+    local action="$1"
+    local service="$2"
+    
+    if command -v systemctl >/dev/null 2>&1; then
+        # 使用 systemd
+        case "$action" in
+            "start") systemctl start "$service" ;;
+            "stop") systemctl stop "$service" ;;
+            "restart") systemctl restart "$service" ;;
+            "status") systemctl status "$service" --no-pager ;;
+            "enable") systemctl enable "$service" ;;
+            "disable") systemctl disable "$service" ;;
+        esac
+    elif [ -f "/etc/init.d/$service" ]; then
+        # 使用 init.d (OpenWrt)
+        case "$action" in
+            "start") /etc/init.d/"$service" start ;;
+            "stop") /etc/init.d/"$service" stop ;;
+            "restart") /etc/init.d/"$service" restart ;;
+            "status") /etc/init.d/"$service" status ;;
+            "enable") /etc/init.d/"$service" enable ;;
+            "disable") /etc/init.d/"$service" disable ;;
+        esac
+    else
+        return 1
+    fi
+}
+
+# OpenWrt兼容的IP获取函数
+get_local_ip() {
+    local ip=""
+    
+    # 方法1: 尝试使用hostname命令
+    if command -v hostname >/dev/null 2>&1; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    
+    # 方法2: 如果hostname不可用，尝试使用ip命令
+    if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+        ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' | head -1)
+    fi
+    
+    # 方法3: 尝试使用ifconfig
+    if [ -z "$ip" ] && command -v ifconfig >/dev/null 2>&1; then
+        ip=$(ifconfig 2>/dev/null | grep -E 'inet.*192\.168\.|inet.*10\.|inet.*172\.' | head -1 | awk '{print $2}' | cut -d: -f2)
+    fi
+    
+    # 方法4: 读取网络接口文件 (OpenWrt)
+    if [ -z "$ip" ] && [ -f "/proc/net/route" ]; then
+        local interface=$(awk '/^[a-zA-Z]/ && $2 == "00000000" {print $1; exit}' /proc/net/route 2>/dev/null)
+        if [ -n "$interface" ] && [ -f "/sys/class/net/$interface/address" ]; then
+            ip=$(ip addr show "$interface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+        fi
+    fi
+    
+    # 方法5: 尝试从常见网络接口获取
+    if [ -z "$ip" ]; then
+        for iface in br-lan eth0 wlan0 en0 ens33; do
+            if [ -d "/sys/class/net/$iface" ]; then
+                ip=$(ip addr show "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+                [ -n "$ip" ] && break
+            fi
+        done
+    fi
+    
+    # 默认值
+    echo "${ip:-localhost}"
+}
+
 show_welcome() {
     echo -e "${GREEN}"
     echo "=================================================="
@@ -1896,7 +1967,16 @@ function toggleHelp() {
             def restart_service():
                 time.sleep(2)
                 try:
-                    subprocess.run(['systemctl', 'restart', 'frpc'], check=False, capture_output=True)
+                    # 智能检测服务管理方式
+                    if os.path.exists('/bin/systemctl') or os.path.exists('/usr/bin/systemctl'):
+                        subprocess.run(['systemctl', 'restart', 'frpc'], check=False, capture_output=True)
+                    elif os.path.exists('/etc/init.d/frpc'):
+                        subprocess.run(['/etc/init.d/frpc', 'restart'], check=False, capture_output=True)
+                    else:
+                        # 直接重启进程
+                        subprocess.run(['pkill', '-f', 'frpc-bin'], check=False)
+                        time.sleep(1)
+                        subprocess.Popen(['/usr/local/bin/frpc-bin', '-c', CONFIG_FILE])
                 except:
                     pass
             
@@ -2056,23 +2136,55 @@ log_max_days = 3
                 self.send_json({'success': False, 'error': '无效的操作'}, 400)
                 return
             
-            # 尝试 systemctl
-            result = subprocess.run(['systemctl', action, 'frpc'], capture_output=True, text=True)
-            if result.returncode == 0:
-                self.send_json({'success': True, 'message': f'服务{action}成功'})
+            # 智能检测服务管理方式
+            success = False
+            message = ""
+            
+            # 优先尝试 systemctl (systemd)
+            if os.path.exists('/bin/systemctl') or os.path.exists('/usr/bin/systemctl'):
+                try:
+                    result = subprocess.run(['systemctl', action, 'frpc'], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        success = True
+                        message = f'服务{action}成功'
+                except:
+                    pass
+            
+            # 如果 systemctl 不可用或失败，尝试 init.d (OpenWrt)
+            if not success and os.path.exists('/etc/init.d/frpc'):
+                try:
+                    result = subprocess.run(['/etc/init.d/frpc', action], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        success = True
+                        message = f'服务{action}成功'
+                except:
+                    pass
+            
+            # 如果以上都失败，尝试直接操作进程
+            if not success:
+                try:
+                    if action == 'stop':
+                        subprocess.run(['pkill', '-f', 'frpc-bin'], check=False)
+                        success = True
+                        message = '服务停止成功'
+                    elif action == 'start':
+                        subprocess.Popen(['/usr/local/bin/frpc-bin', '-c', CONFIG_FILE])
+                        success = True
+                        message = '服务启动成功'
+                    elif action == 'restart':
+                        subprocess.run(['pkill', '-f', 'frpc-bin'], check=False)
+                        time.sleep(1)
+                        subprocess.Popen(['/usr/local/bin/frpc-bin', '-c', CONFIG_FILE])
+                        success = True
+                        message = '服务重启成功'
+                except Exception as e:
+                    success = False
+                    message = f'操作失败: {str(e)}'
+            
+            if success:
+                self.send_json({'success': True, 'message': message})
             else:
-                # 如果 systemctl 失败，尝试直接操作进程
-                if action == 'stop':
-                    subprocess.run(['pkill', '-f', 'frpc'])
-                    self.send_json({'success': True, 'message': '服务停止成功'})
-                elif action == 'start':
-                    subprocess.Popen(['/usr/local/bin/frpc', '-c', CONFIG_FILE])
-                    self.send_json({'success': True, 'message': '服务启动成功'})
-                elif action == 'restart':
-                    subprocess.run(['pkill', '-f', 'frpc'])
-                    time.sleep(1)
-                    subprocess.Popen(['/usr/local/bin/frpc', '-c', CONFIG_FILE])
-                    self.send_json({'success': True, 'message': '服务重启成功'})
+                self.send_json({'success': False, 'error': message or '服务操作失败'})
         except Exception as e:
             self.send_json({'success': False, 'error': str(e)}, 500)
     
@@ -2253,7 +2365,16 @@ log_max_days = 3
                 time.sleep(2)
                 try:
                     import subprocess
-                    subprocess.run(['systemctl', 'restart', 'frpc'], check=False, capture_output=True)
+                    # 智能检测服务管理方式
+                    if os.path.exists('/bin/systemctl') or os.path.exists('/usr/bin/systemctl'):
+                        subprocess.run(['systemctl', 'restart', 'frpc'], check=False, capture_output=True)
+                    elif os.path.exists('/etc/init.d/frpc'):
+                        subprocess.run(['/etc/init.d/frpc', 'restart'], check=False, capture_output=True)
+                    else:
+                        # 直接重启进程
+                        subprocess.run(['pkill', '-f', 'frpc-bin'], check=False)
+                        time.sleep(1)
+                        subprocess.Popen(['/usr/local/bin/frpc-bin', '-c', CONFIG_FILE])
                 except:
                     pass
             
@@ -2427,18 +2548,44 @@ fix_existing_installation() {
 create_frpc_command() {
     print_info "创建 FRPC 管理快捷命令..."
     
+    # 删除旧的frpc命令（如果存在）
+    rm -f "/usr/local/bin/frpc" 2>/dev/null
+    
     # 直接创建 frpc 管理命令
     local cmd_file="/usr/local/bin/frpc"
     
     cat > "$cmd_file" << 'EOF'
 #!/bin/bash
 
-# FRPC 智能命令
+# FRPC 智能命令 - OpenWrt优化版
 # 带参数时作为 FRPC 客户端运行，不带参数时显示管理菜单
+
+# 配置文件路径
+CONFIG_FILE="/etc/frpc/frpc.toml"
+FRPC_BIN="/usr/local/bin/frpc-bin"
 
 # 如果有参数，直接调用 FRPC 二进制文件
 if [ $# -gt 0 ]; then
-    exec /usr/local/bin/frpc-bin "$@"
+    # 检查配置文件是否存在
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "错误: 配置文件 $CONFIG_FILE 不存在"
+        echo "请先运行安装脚本或手动创建配置文件"
+        exit 1
+    fi
+    
+    # 检查二进制文件是否存在
+    if [ ! -f "$FRPC_BIN" ]; then
+        echo "错误: FRPC 二进制文件 $FRPC_BIN 不存在"
+        echo "请重新运行安装脚本"
+        exit 1
+    fi
+    
+    # 如果没有指定配置文件，自动添加默认配置文件
+    if [[ "$*" != *"-c"* ]] && [[ "$*" != *"--config"* ]]; then
+        exec "$FRPC_BIN" -c "$CONFIG_FILE" "$@"
+    else
+        exec "$FRPC_BIN" "$@"
+    fi
 fi
 
 # 没有参数时显示管理菜单
@@ -2472,7 +2619,8 @@ show_menu() {
     echo "  6) 🌐 打开 Web 管理面板"
     echo "  7) 📝 编辑配置文件"
     echo "  8) 🔧 更新 FRPC"
-    echo "  9) 🗑️  卸载 FRPC"
+    echo "  9) 🔧 修复命令 (OpenWrt)"
+    echo "  10) 🗑️ 卸载 FRPC"
     echo "  0) 🚪 退出"
     echo ""
 }
@@ -2483,7 +2631,7 @@ get_web_panel_url() {
         port=$(ss -tlnp 2>/dev/null | grep ":808[0-9]" | head -1 | awk '{print $5}' | cut -d: -f2)
     fi
     port=${port:-8080}
-    local ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo 'localhost')
+    local ip=$(get_local_ip)
     echo "http://$ip:$port"
 }
 
@@ -2507,7 +2655,19 @@ stop_service() {
 
 restart_service() {
     print_info "重启 FRPC 服务..."
-    if systemctl restart frpc && systemctl restart frpc-web; then
+    local success=true
+    
+    # 重启 FRPC 服务
+    if ! service_control restart frpc; then
+        success=false
+    fi
+    
+    # 重启 Web 面板服务
+    if ! service_control restart frpc-web; then
+        success=false
+    fi
+    
+    if [ "$success" = true ]; then
         print_success "✅ FRPC 服务重启成功"
     else
         print_error "❌ FRPC 服务重启失败"
@@ -2616,7 +2776,7 @@ update_frpc() {
         install_frpc
         print_success "FRPC 更新完成！版本: $latest_version"
         print_info "配置文件已保留，服务将自动重启"
-        systemctl restart frpc 2>/dev/null || true
+        service_control restart frpc 2>/dev/null || true
     fi
 }
 
@@ -2652,7 +2812,7 @@ main() {
     
     while true; do
         show_menu
-        read -p "请输入选项 [0-9]: " choice
+        read -p "请输入选项 [0-10]: " choice
         case $choice in
             1) start_service; read -p "按 Enter 键继续..." ;;
             2) stop_service; read -p "按 Enter 键继续..." ;;
@@ -2662,7 +2822,8 @@ main() {
             6) open_web_panel; read -p "按 Enter 键继续..." ;;
             7) edit_config ;;
             8) update_frpc ;;
-            9) uninstall_frpc ;;
+            9) fix_frpc_command_openwrt; read -p "按 Enter 键继续..." ;;
+            10) uninstall_frpc ;;
             0) print_info "再见！"; exit 0 ;;
             *) print_warning "无效选项，请重新选择"; sleep 1 ;;
         esac
@@ -2686,7 +2847,7 @@ EOF
 
 # 显示安装完成信息
 show_completion() {
-    local ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo 'localhost')
+    local ip=$(get_local_ip)
     
     echo ""
     print_success "🎉 FRPC 修复完成！"
@@ -2786,10 +2947,17 @@ if [ $# -gt 0 ]; then
     fi
 else
     echo "🚀 FRPC 管理菜单"
-    echo "1) systemctl start frpc    # 启动服务"
-    echo "2) systemctl stop frpc     # 停止服务"
-    echo "3) systemctl restart frpc  # 重启服务"
-    echo "4) systemctl status frpc   # 查看状态"
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "1) systemctl start frpc    # 启动服务"
+        echo "2) systemctl stop frpc     # 停止服务"
+        echo "3) systemctl restart frpc  # 重启服务"
+        echo "4) systemctl status frpc   # 查看状态"
+    elif [ -f "/etc/init.d/frpc" ]; then
+        echo "1) /etc/init.d/frpc start    # 启动服务"
+        echo "2) /etc/init.d/frpc stop     # 停止服务"
+        echo "3) /etc/init.d/frpc restart  # 重启服务"
+        echo "4) /etc/init.d/frpc status   # 查看状态"
+    fi
 fi
 SIMPLE_EOF
             chmod +x "/usr/local/bin/frpc" || print_error "无法创建 frpc 命令"
@@ -2803,7 +2971,7 @@ SIMPLE_EOF
         fi
         
         # 显示完成信息
-        local ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo 'localhost')
+        local ip=$(get_local_ip)
         
         echo ""
         print_success "🎉 FRPC 安装完成！"
@@ -2821,6 +2989,78 @@ SIMPLE_EOF
         echo ""
         print_success "现在可以通过浏览器访问 Web 管理面板进行配置！"
     fi
+}
+
+# 强制修复frpc命令 - OpenWrt专用
+fix_frpc_command_openwrt() {
+    print_info "强制修复 FRPC 命令（OpenWrt优化）..."
+    
+    # 停止可能运行的frpc进程
+    pkill -f "frpc" 2>/dev/null || true
+    
+    # 删除所有可能的frpc命令文件
+    rm -f "/usr/local/bin/frpc" 2>/dev/null
+    rm -f "/usr/bin/frpc" 2>/dev/null
+    rm -f "/bin/frpc" 2>/dev/null
+    
+    # 创建简化的OpenWrt专用frpc命令
+    cat > "/usr/local/bin/frpc" << 'EOF'
+#!/bin/bash
+
+# FRPC OpenWrt专用命令
+CONFIG_FILE="/etc/frpc/frpc.toml"
+FRPC_BIN="/usr/local/bin/frpc-bin"
+
+# 检查文件是否存在
+if [ ! -f "$FRPC_BIN" ]; then
+    echo "错误: FRPC 二进制文件不存在: $FRPC_BIN"
+    exit 1
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "错误: 配置文件不存在: $CONFIG_FILE"
+    echo "请检查配置文件路径或重新运行安装脚本"
+    exit 1
+fi
+
+# 如果有参数，直接运行
+if [ $# -gt 0 ]; then
+    # 强制使用正确的配置文件
+    if [[ "$*" != *"-c"* ]] && [[ "$*" != *"--config"* ]]; then
+        exec "$FRPC_BIN" -c "$CONFIG_FILE" "$@"
+    else
+        exec "$FRPC_BIN" "$@"
+    fi
+else
+    # 无参数时显示帮助
+    echo "FRPC 客户端命令"
+    echo "用法: frpc [选项]"
+    echo ""
+    echo "常用命令:"
+    echo "  frpc                    # 显示此帮助"
+    echo "  frpc -c /path/config    # 使用指定配置文件"
+    echo "  frpc --help             # 显示详细帮助"
+    echo ""
+    echo "配置文件: $CONFIG_FILE"
+    echo "二进制文件: $FRPC_BIN"
+    echo ""
+    echo "服务管理:"
+    if [ -f "/etc/init.d/frpc" ]; then
+        echo "  /etc/init.d/frpc start    # 启动服务"
+        echo "  /etc/init.d/frpc stop     # 停止服务"
+        echo "  /etc/init.d/frpc restart  # 重启服务"
+        echo "  /etc/init.d/frpc status   # 查看状态"
+    fi
+fi
+EOF
+    
+    chmod +x "/usr/local/bin/frpc"
+    print_success "OpenWrt专用 FRPC 命令修复完成"
+    
+    # 测试命令
+    echo ""
+    print_info "测试 frpc 命令:"
+    /usr/local/bin/frpc
 }
 
 # 脚本入口点
