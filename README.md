@@ -54,9 +54,7 @@
 
 ```bash
 # 下载并运行安装脚本
-wget -O frpc-install.sh https://raw.githubusercontent.com/your-repo/frpc-installer/main/frpc-installer-final-fixed-clean.sh
-chmod +x frpc-install.sh
-sudo ./frpc-install.sh
+wget -O frpc-install.sh https://raw.githubusercontent.com/xx2468171796/frpconekeyforweb/main/frpc-install.sh && chmod +x frpc-install.sh && sudo ./frpc-install.sh
 ```
 
 ### 安装过程
